@@ -50,6 +50,8 @@ const DUOPLUS_GATEWAY = "https://agent-gateway.duoplus.net/agent-command";
 const DUOPLUS_GATEWAY_TIMEOUT_MS = 60_000;
 const GATEWAY_REGION = /^[a-z]{2}\d*$/;
 const GATEWAY_IP = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+// Seen live: "automation result exceeds Binder V1 limit" for a ~400 KB home-screen screenshot.
+const GATEWAY_TOO_LARGE = /exceeds Binder/i;
 // Without the gateway, the same agent service on every cloud phone takes Base64 JSON actions over this broadcast. Base64 is shell-safe.
 const DUOPLUS_AGENT_BROADCAST = "com.duoplus.service.PROCESS_DATA";
 // Agent actions run after the broadcast returns; wait so the next read or tap sees their effect.
@@ -296,7 +298,8 @@ export function createDuoPlusClient(
       try {
         content = await gateway(serial, "SHELL_COMMAND", { command, need_screenshot: false });
       } catch (error) {
-        if (!(error instanceof GatewayUnavailable)) throw error;
+        // The gateway can't return large output (a wallpapered screenshot); the commands that produce it only read.
+        if (!(error instanceof GatewayUnavailable) && !(error instanceof Error && GATEWAY_TOO_LARGE.test(error.message))) throw error;
         content = await platformCommand(serial, command);
       }
       return base64 ? Buffer.from(content.replace(/\s+/g, ""), "base64") : Buffer.from(content, "utf8");

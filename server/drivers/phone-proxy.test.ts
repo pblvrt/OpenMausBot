@@ -239,6 +239,19 @@ describe("DuoPlus cloud phones", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("reads output too large for the gateway, such as a screenshot, through the command API", async () => {
+    const png = Buffer.from("89504e470d0a1a0a", "hex");
+    const { calls, fetchImpl } = stub((request) => request.url.endsWith("/list")
+      ? respond({ code: 200, data: { list: [gatewayPhone] } })
+      : request.url.endsWith("/agent-command")
+        ? gatewayReply({ success: false, message: "automation result exceeds Binder V1 limit" }, "FAILED")
+        : respond({ code: 200, data: { success: true, content: png.toString("base64") } }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, noSleep)!;
+    await client.devices();
+    await expect(client.run("duoplus:a", ["exec-out", "screencap", "-p"])).resolves.toEqual(png);
+    expect(calls.map((call) => new URL(call.request.url).pathname)).toEqual(["/api/v1/cloudPhone/list", "/agent-command", "/api/v1/cloudPhone/command"]);
+  });
+
   it("falls back to the command API and the agent broadcast when the gateway cannot reach the phone", async () => {
     const waits: number[] = [];
     const { calls, fetchImpl } = stub((request) => request.url.endsWith("/list")
