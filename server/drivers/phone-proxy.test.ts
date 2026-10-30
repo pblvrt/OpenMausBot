@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   createDuoPlusClient,
   createPhoneClaim,
+  duoPlusAgentCommand,
   duoPlusCommand,
   findPackages,
   parseDevices,
@@ -142,6 +143,16 @@ describe("DuoPlus cloud phones", () => {
     expect(duoPlusCommand(["shell", "input", "tap", "10", "20"])).toEqual({ command: "input tap 10 20", base64: false });
     expect(duoPlusCommand(["exec-out", "screencap", "-p"])).toEqual({ command: "screencap -p | base64", base64: true });
     expect(() => duoPlusCommand(["install", "app.apk"])).toThrow(/do not support adb install/);
+  });
+
+  it("encodes DuoPlus agent actions as a shell-safe broadcast", () => {
+    const command = duoPlusAgentCommand("INPUT_CONTENT", { content: "café 日本 $(rm -rf /)'\"", clear_first: false }, "t1");
+    const match = /^am broadcast -a com\.duoplus\.service\.PROCESS_DATA --es message ([A-Za-z0-9+/=]+)$/.exec(command);
+    expect(match).not.toBeNull();
+    expect(JSON.parse(Buffer.from(match![1], "base64").toString("utf8"))).toEqual({
+      task_type: "ai", action: "execute", task_id: "t1", md5: "mausbot",
+      action_name: "INPUT_CONTENT", params: { content: "café 日本 $(rm -rf /)'\"", clear_first: false },
+    });
   });
 
   it("authenticates, lists phones, and runs commands by phone id", async () => {

@@ -45,6 +45,12 @@ const DUOPLUS_STATES: Record<number, string> = {
   11: "configuring",
   12: "configuration failed",
 };
+// The DuoPlus agent service on every cloud phone takes Base64 JSON actions over this broadcast. Base64 is shell-safe.
+const DUOPLUS_AGENT_BROADCAST = "com.duoplus.service.PROCESS_DATA";
+// Agent actions run after the broadcast returns; wait so the next read or tap sees their effect.
+const DUOPLUS_AGENT_SETTLE_MS = 1_500;
+// Any visible text, one line: the agent service types Unicode, unlike `input text`.
+const CLOUD_TEXT = /^[^\p{Cc}]+$/u;
 const KNOWN_PACKAGES: Record<string, string> = {
   skyscanner: "net.skyscanner.android.main",
   uber: "com.ubercab",
@@ -156,6 +162,12 @@ export function duoPlusCommand(args: string[]): { command: string; base64: boole
   throw new Error(`DuoPlus cloud phones do not support adb ${args[0] ?? ""}`);
 }
 
+/** One DuoPlus agent action as a shell command; the service acts on it without replying. */
+export function duoPlusAgentCommand(actionName: string, params: Json, taskId = `mausbot-${Date.now()}`): string {
+  const payload = { task_type: "ai", action: "execute", task_id: taskId, md5: "mausbot", action_name: actionName, params };
+  return `am broadcast -a ${DUOPLUS_AGENT_BROADCAST} --es message ${Buffer.from(JSON.stringify(payload), "utf8").toString("base64")}`;
+}
+
 export function createDuoPlusClient(
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl: typeof fetch = fetch,
@@ -239,6 +251,12 @@ async function readySerial(requested?: unknown): Promise<string> {
 async function onDevice(serial: string, args: string[], binary = false) {
   if (duoPlus && serial.startsWith(DUOPLUS_PREFIX)) return duoPlus.run(serial, args);
   return runAdb(["-s", serial, ...args], { binary });
+}
+
+async function duoPlusAgent(serial: string, actionName: string, params: Json) {
+  const output = (await onDevice(serial, ["shell", duoPlusAgentCommand(actionName, params)])).toString("utf8");
+  if (!output.includes("Broadcast completed")) throw new Error("The DuoPlus cloud phone did not accept the action");
+  await new Promise((resolve) => setTimeout(resolve, DUOPLUS_AGENT_SETTLE_MS));
 }
 
 function normalize(value: string) {
@@ -341,7 +359,7 @@ const TOOLS = [
   { name: "tap_text", description: "Tap visible Android text or an accessibility label, then use read_screen to verify.", inputSchema: { type: "object", properties: { text: { type: "string" }, exact: { type: "boolean" }, index: { type: "integer", minimum: 0 }, serial: { type: "string" } }, required: ["text"] } },
   { name: "tap", description: "Tap Android screen pixel coordinates obtained from read_screen or screenshot.", inputSchema: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, serial: { type: "string" } }, required: ["x", "y"] } },
   { name: "swipe", description: "Swipe the Android screen in a direction, then use read_screen to verify.", inputSchema: { type: "object", properties: { direction: { type: "string", enum: ["up", "down", "left", "right"] }, serial: { type: "string" } }, required: ["direction"] } },
-  { name: "type_text", description: "Type basic ASCII text into the focused Android field. Never enter passwords or payment details. A one-time code only for a sign-in the person asked for, into the app it was sent for.", inputSchema: { type: "object", properties: { text: { type: "string", maxLength: 256 }, serial: { type: "string" } }, required: ["text"] } },
+  { name: "type_text", description: "Type basic ASCII text into the focused Android field (any one-line text, including accents and emoji, on DuoPlus cloud phones). Never enter passwords or payment details. A one-time code only for a sign-in the person asked for, into the app it was sent for.", inputSchema: { type: "object", properties: { text: { type: "string", maxLength: 256 }, serial: { type: "string" } }, required: ["text"] } },
   { name: "press", description: "Press an Android navigation or keyboard key.", inputSchema: { type: "object", properties: { key: { type: "string", enum: Object.keys(KEYCODES) }, serial: { type: "string" } }, required: ["key"] } },
 ] as const;
 
@@ -395,6 +413,7 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
     return textResult(JSON.stringify({ available: Boolean(adb || duoPlus), devices, ...(cloudError ? { cloudError } : {}) }, null, 2));
   }
   const serial = await readySerial(args.serial);
+  const cloud = Boolean(duoPlus) && serial.startsWith(DUOPLUS_PREFIX);
   if (name === "read_screen") return textResult(nodeLines(await readNodes(serial)));
   if (name === "screenshot") {
     const png = await onDevice(serial, ["exec-out", "screencap", "-p"], true);
@@ -437,6 +456,11 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
   }
   if (name === "swipe") {
     const direction = String(args.direction ?? "");
+    if (cloud) {
+      if (!["up", "down", "left", "right"].includes(direction)) throw new Error("Invalid swipe direction");
+      await duoPlusAgent(serial, "SLIDE_PAGE", { direction });
+      return textResult(`Swiped ${direction}`);
+    }
     const size = (await onDevice(serial, ["shell", "wm", "size"])).toString("utf8");
     const match = /(\d+)x(\d+)/.exec(size);
     if (!match) throw new Error("Could not read Android screen size");
@@ -454,6 +478,11 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
   }
   if (name === "type_text") {
     const value = String(args.text ?? "");
+    if (cloud) {
+      if (!value || value.length > 256 || !CLOUD_TEXT.test(value)) throw new Error("Android text must be one line of up to 256 characters");
+      await duoPlusAgent(serial, "INPUT_CONTENT", { content: value, clear_first: false });
+      return textResult("Typed text into the focused Android field");
+    }
     if (!value || value.length > 256 || !SAFE_TEXT.test(value)) throw new Error("Android text supports only basic ASCII text up to 256 characters");
     await onDevice(serial, ["shell", "input", "text", value.replaceAll(" ", "%s")]);
     return textResult("Typed text into the focused Android field");
