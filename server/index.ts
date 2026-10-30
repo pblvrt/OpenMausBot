@@ -1449,9 +1449,9 @@ const firstEngineRead = holdUntilFirstEngineRead();
 await registry.load(providerConfigs(), decorateHostedProvider);
 const bundledSkills = loadBundledSkills();
 const availableSkills = () => mergeSkills(bundledSkills, loadUserSkills(join(DATA_DIR, "skills")));
-/** Every turn the engine can mount it, whatever its words: they pick only the skill's instructions. A Cloud home or a hosted workspace has no USB port. */
+/** Every turn the engine can mount it, whatever its words: they pick only the skill's instructions. A Cloud home or a hosted workspace has no USB port, so only DuoPlus cloud phones can reach it there. */
 const usbPhoneOffered = (instance: { adapter: { capabilities: { phoneMcp?: boolean } } }, skills: readonly BundledSkill[]) => instance.adapter.capabilities.phoneMcp === true &&
-  !CLOUD_HOME && !HOSTED_WORKSPACE && skills.some(({ manifest }) => manifest.defaultEnabled && manifest.requiredCapabilities.includes("phoneMcp"));
+  ((!CLOUD_HOME && !HOSTED_WORKSPACE) || Boolean(process.env.DUOPLUS_API_KEY)) && skills.some(({ manifest }) => manifest.defaultEnabled && manifest.requiredCapabilities.includes("phoneMcp"));
 
 type UtilityParentPort = {
   on(event: "message", listener: (event: { data?: object }) => void): void;
@@ -2503,6 +2503,8 @@ function phoneIntegration(botId: string, threadId: string, generation: string) {
   if (process.env.OMB_ADB_PATH) env.OMB_ADB_PATH = process.env.OMB_ADB_PATH;
   if (process.env.OMB_RESOURCES_PATH) env.OMB_RESOURCES_PATH = process.env.OMB_RESOURCES_PATH;
   if (process.env.PH_ANDROID_SERIAL) env.PH_ANDROID_SERIAL = process.env.PH_ANDROID_SERIAL;
+  if (process.env.DUOPLUS_API_KEY) env.DUOPLUS_API_KEY = process.env.DUOPLUS_API_KEY;
+  if (process.env.DUOPLUS_API_URL) env.DUOPLUS_API_URL = process.env.DUOPLUS_API_URL;
   return { command: process.execPath, args: [phoneProxyPath], env };
 }
 

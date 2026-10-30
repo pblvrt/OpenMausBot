@@ -1,4 +1,5 @@
-// First-party Android phone MCP server: physical USB devices only (no emulators, wireless or network ADB).
+// First-party Android phone MCP server: physical USB devices (no emulators, wireless or network ADB), plus
+// DuoPlus cloud phones driven through DuoPlus's own HTTPS API when DUOPLUS_API_KEY is set.
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -6,7 +7,7 @@ import { delimiter, join } from "node:path";
 import { homedir } from "node:os";
 
 type Json = Record<string, unknown>;
-type Device = { serial: string; state: string; model: string; connection: "usb" | "network" | "emulator" };
+type Device = { serial: string; state: string; model: string; connection: "usb" | "network" | "emulator" | "cloud" };
 type UiNode = { text: string; description: string; id: string; className: string; bounds: [number, number, number, number] };
 type ClaimOutcome = { ok: true } | { ok: false; message: string };
 
@@ -29,6 +30,20 @@ const KEYCODES: Record<string, string> = {
   space: "KEYCODE_SPACE",
   tab: "KEYCODE_TAB",
   up: "KEYCODE_DPAD_UP",
+};
+const DUOPLUS_API = "https://openapi.duoplus.net";
+const DUOPLUS_PREFIX = "duoplus:";
+// DuoPlus allows one request per second on each endpoint.
+const DUOPLUS_INTERVAL_MS = 1_000;
+const DUOPLUS_STATES: Record<number, string> = {
+  0: "not configured",
+  1: "device",
+  2: "powered off",
+  3: "expired",
+  4: "renewal overdue",
+  10: "powering on",
+  11: "configuring",
+  12: "configuration failed",
 };
 const KNOWN_PACKAGES: Record<string, string> = {
   skyscanner: "net.skyscanner.android.main",
@@ -117,24 +132,112 @@ export function parseDevices(output: string): Device[] {
   return devices;
 }
 
+type DuoPlusPhone = { id?: unknown; name?: unknown; status?: unknown; os?: unknown };
+
+export function parseDuoPlusPhones(list: unknown): Device[] {
+  if (!Array.isArray(list)) return [];
+  return (list as DuoPlusPhone[]).flatMap((phone) => {
+    if (typeof phone?.id !== "string" || !phone.id) return [];
+    const status = Number(phone.status);
+    const label = [phone.name, phone.os].filter((part) => typeof part === "string" && part).join(", ");
+    return [{
+      serial: `${DUOPLUS_PREFIX}${phone.id}`,
+      state: DUOPLUS_STATES[status] ?? `status ${String(phone.status)}`,
+      connection: "cloud" as const,
+      model: label ? `DuoPlus cloud phone (${label})` : "DuoPlus cloud phone",
+    }];
+  });
+}
+
+/** Maps the adb arguments this proxy uses onto one DuoPlus shell command. `adb shell a b` joins with spaces too. */
+export function duoPlusCommand(args: string[]): { command: string; base64: boolean } {
+  if (args[0] === "shell" && args.length > 1) return { command: args.slice(1).join(" "), base64: false };
+  if (args[0] === "exec-out" && args[1] === "screencap") return { command: "screencap -p | base64", base64: true };
+  throw new Error(`DuoPlus cloud phones do not support adb ${args[0] ?? ""}`);
+}
+
+export function createDuoPlusClient(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof fetch = fetch,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+) {
+  const key = env.DUOPLUS_API_KEY?.trim();
+  if (!key) return null;
+  const base = env.DUOPLUS_API_URL?.trim() || DUOPLUS_API;
+  const lastCall = new Map<string, number>();
+  let queue: Promise<unknown> = Promise.resolve();
+
+  async function request(path: string, body: Json): Promise<unknown> {
+    const wait = (lastCall.get(path) ?? 0) + DUOPLUS_INTERVAL_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastCall.set(path, Date.now());
+    const response = await fetchImpl(new URL(path, base), {
+      method: "POST",
+      redirect: "error",
+      headers: { "DuoPlus-API-Key": key!, "content-type": "application/json", lang: "en" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const payload = await response.json().catch(() => null) as { code?: unknown; message?: unknown; data?: unknown } | null;
+    if (!response.ok || payload?.code !== 200) {
+      const reason = typeof payload?.message === "string" && payload.message ? payload.message : `HTTP ${response.status}`;
+      throw new Error(`DuoPlus refused the request: ${reason}`);
+    }
+    return payload.data;
+  }
+  // One request at a time keeps every endpoint under its rate limit.
+  const call = (path: string, body: Json) => {
+    const run = queue.then(() => request(path, body));
+    queue = run.catch(() => undefined);
+    return run;
+  };
+
+  return {
+    async devices(): Promise<Device[]> {
+      const data = await call("/api/v1/cloudPhone/list", { page: 1, pagesize: 100 }) as { list?: unknown } | null;
+      return parseDuoPlusPhones(data?.list);
+    },
+    async run(serial: string, args: string[]): Promise<Buffer> {
+      const { command, base64 } = duoPlusCommand(args);
+      const data = await call("/api/v1/cloudPhone/command", { image_id: serial.slice(DUOPLUS_PREFIX.length), command }) as
+        { success?: unknown; content?: unknown; message?: unknown } | null;
+      if (data?.success !== true) {
+        throw new Error(typeof data?.message === "string" && data.message ? data.message : "The DuoPlus cloud phone did not run the command");
+      }
+      const content = typeof data.content === "string" ? data.content : "";
+      return base64 ? Buffer.from(content.replace(/\s+/g, ""), "base64") : Buffer.from(content, "utf8");
+    },
+  };
+}
+
+const duoPlus = createDuoPlusClient();
+
 async function usbDevices() {
   if (!resolveAdbPath()) return [];
   return parseDevices((await runAdb(["devices", "-l"])).toString("utf8")).filter((device) => device.connection === "usb");
 }
 
+async function phoneDevices() {
+  return [...await usbDevices(), ...(duoPlus ? await duoPlus.devices() : [])];
+}
+
 async function readySerial(requested?: unknown): Promise<string> {
-  const devices = await usbDevices();
+  const devices = await phoneDevices();
   const serial = typeof requested === "string" && requested ? requested : process.env.PH_ANDROID_SERIAL;
   const candidates = serial ? devices.filter((device) => device.serial === serial) : devices;
-  if (!candidates.length) throw new Error("No physical USB Android device is connected");
-  if (candidates.length > 1 && !serial) throw new Error("Multiple USB Android devices are connected; pass serial");
+  if (!candidates.length) throw new Error(duoPlus ? "No USB Android device or DuoPlus cloud phone is available" : "No physical USB Android device is connected");
+  if (candidates.length > 1 && !serial) throw new Error("Multiple Android devices are available; pass serial");
   const device = candidates[0];
   if (device.state === "unauthorized") throw new Error("Unlock the phone and accept Allow USB debugging");
+  if (device.connection === "cloud" && device.state !== "device") {
+    throw new Error(`The DuoPlus cloud phone is ${device.state}. Start it in DuoPlus, then try again.`);
+  }
   if (device.state !== "device") throw new Error(`The Android device is ${device.state}`);
   return device.serial;
 }
 
 async function onDevice(serial: string, args: string[], binary = false) {
+  if (duoPlus && serial.startsWith(DUOPLUS_PREFIX)) return duoPlus.run(serial, args);
   return runAdb(["-s", serial, ...args], { binary });
 }
 
@@ -230,7 +333,7 @@ function nodeLines(nodes: UiNode[]) {
 }
 
 const TOOLS = [
-  { name: "status", description: "Check physical USB Android devices and USB-debugging authorization before any Android phone task.", inputSchema: { type: "object", properties: {} } },
+  { name: "status", description: "Check physical USB Android devices, USB-debugging authorization, and DuoPlus cloud phones before any Android phone task.", inputSchema: { type: "object", properties: {} } },
   { name: "read_screen", description: "Read visible text, accessibility labels, resource ids, and pixel bounds from the connected Android screen. Use after every action to verify the result.", inputSchema: { type: "object", properties: { serial: { type: "string" } } } },
   { name: "screenshot", description: "Capture the connected Android screen when accessibility text is insufficient. Returns a PNG image.", inputSchema: { type: "object", properties: { serial: { type: "string" } } } },
   { name: "list_apps", description: "List installed launchable Android package names, optionally filtered by a human app name. Prefer open_app first.", inputSchema: { type: "object", properties: { query: { type: "string" }, serial: { type: "string" } } } },
@@ -281,7 +384,15 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
   if (name === "status") {
     const adb = resolveAdbPath();
     const devices = adb ? await usbDevices() : [];
-    return textResult(JSON.stringify({ available: Boolean(adb), devices }, null, 2));
+    let cloudError: string | undefined;
+    if (duoPlus) {
+      try {
+        devices.push(...await duoPlus.devices());
+      } catch (error) {
+        cloudError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    return textResult(JSON.stringify({ available: Boolean(adb || duoPlus), devices, ...(cloudError ? { cloudError } : {}) }, null, 2));
   }
   const serial = await readySerial(args.serial);
   if (name === "read_screen") return textResult(nodeLines(await readNodes(serial)));

@@ -1,6 +1,6 @@
 ---
 name: phone-harness
-description: "Control, inspect, test, or automate a physical Android phone connected to OpenMausBot over authorized USB debugging. Use for explicit Android, USB phone, ADB, mobile-app, tapping, typing, swiping, scrolling, screenshot, or phone-screen requests."
+description: "Control, inspect, test, or automate a physical Android phone connected to OpenMausBot over authorized USB debugging, or a DuoPlus cloud phone. Use for explicit Android, USB phone, ADB, mobile-app, tapping, typing, swiping, scrolling, screenshot, or phone-screen requests."
 ---
 
 # Phone Harness
@@ -9,7 +9,9 @@ Use the `phone` tools for every requested Android action. Never replace them
 with Bash, raw `adb`, `subprocess`, an emulator, network ADB, or Tailscale.
 
 1. Call `status` before the first action. If the device is missing or
-   unauthorized, stop and relay the physical setup instruction.
+   unauthorized, stop and relay the physical setup instruction. DuoPlus cloud
+   phones appear as `duoplus:<id>`; if one is powered off, ask the user to
+   start it in DuoPlus, since starting it is billed.
 2. Call `open_app` with the human app name. Do not scan the launcher first.
    Use `list_apps` only when the name is ambiguous.
 3. Call `read_screen` before choosing a target and after every action. Prefer

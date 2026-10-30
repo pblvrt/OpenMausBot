@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { createPhoneClaim, findPackages, parseDevices, parseLaunchablePackages, parseUiNodes } from "./phone-proxy.ts";
+import {
+  createDuoPlusClient,
+  createPhoneClaim,
+  duoPlusCommand,
+  findPackages,
+  parseDevices,
+  parseDuoPlusPhones,
+  parseLaunchablePackages,
+  parseUiNodes,
+} from "./phone-proxy.ts";
 
 describe("phone MCP parsing", () => {
   it("keeps physical USB devices distinguishable from network and emulator transports", () => {
@@ -95,5 +104,84 @@ describe("phone MCP lazy claim gate", () => {
     await expect(ensure()).resolves.toEqual({ ok: false, message: "This turn no longer has phone access. Start a new turn to use the phone." });
     reject = true;
     await expect(ensure()).resolves.toMatchObject({ ok: false, message: expect.stringContaining("could not be reached") });
+  });
+});
+
+describe("DuoPlus cloud phones", () => {
+  const respond = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const stub = (handler: (request: Request, body: Record<string, unknown>) => Response) => {
+    const calls: Array<{ request: Request; body: Record<string, unknown> }> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+      const request = new Request(input, init);
+      const body = JSON.parse(await request.clone().text()) as Record<string, unknown>;
+      calls.push({ request, body });
+      return handler(request, body);
+    }) as typeof fetch;
+    return { calls, fetchImpl };
+  };
+  const noSleep = async () => {};
+
+  it("stays off without an API key", () => {
+    expect(createDuoPlusClient({})).toBeNull();
+  });
+
+  it("lists cloud phones as their own transport with readable states", () => {
+    expect(parseDuoPlusPhones([
+      { id: "sChH1", name: "snap", status: 1, os: "Android 15" },
+      { id: "x2", name: "", status: 2, os: "" },
+      { id: "x3", status: 99 },
+      { name: "no id", status: 1 },
+    ])).toEqual([
+      { serial: "duoplus:sChH1", state: "device", connection: "cloud", model: "DuoPlus cloud phone (snap, Android 15)" },
+      { serial: "duoplus:x2", state: "powered off", connection: "cloud", model: "DuoPlus cloud phone" },
+      { serial: "duoplus:x3", state: "status 99", connection: "cloud", model: "DuoPlus cloud phone" },
+    ]);
+  });
+
+  it("maps the adb calls the proxy makes onto DuoPlus shell commands", () => {
+    expect(duoPlusCommand(["shell", "input", "tap", "10", "20"])).toEqual({ command: "input tap 10 20", base64: false });
+    expect(duoPlusCommand(["exec-out", "screencap", "-p"])).toEqual({ command: "screencap -p | base64", base64: true });
+    expect(() => duoPlusCommand(["install", "app.apk"])).toThrow(/do not support adb install/);
+  });
+
+  it("authenticates, lists phones, and runs commands by phone id", async () => {
+    const { calls, fetchImpl } = stub((request) => request.url.endsWith("/list")
+      ? respond({ code: 200, data: { list: [{ id: "sChH1", name: "snap", status: 1, os: "Android 15" }] } })
+      : respond({ code: 200, data: { success: true, content: "Physical size: 1080x2400\n", message: "" } }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, noSleep)!;
+    await expect(client.devices()).resolves.toMatchObject([{ serial: "duoplus:sChH1", state: "device" }]);
+    const output = await client.run("duoplus:sChH1", ["shell", "wm", "size"]);
+    expect(output.toString("utf8")).toBe("Physical size: 1080x2400\n");
+    expect(calls[0].request.url).toBe("https://openapi.duoplus.net/api/v1/cloudPhone/list");
+    expect(calls[0].request.headers.get("DuoPlus-API-Key")).toBe("key");
+    expect(calls[1].body).toEqual({ image_id: "sChH1", command: "wm size" });
+  });
+
+  it("decodes base64 screenshots back to PNG bytes", async () => {
+    const png = Buffer.from("89504e470d0a1a0a0000", "hex");
+    const wrapped = png.toString("base64").replace(/(.{4})/g, "$1\n");
+    const { fetchImpl } = stub(() => respond({ code: 200, data: { success: true, content: wrapped } }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, noSleep)!;
+    await expect(client.run("duoplus:a", ["exec-out", "screencap", "-p"])).resolves.toEqual(png);
+  });
+
+  it("surfaces DuoPlus refusals and failed commands as errors", async () => {
+    let refuse = true;
+    const { fetchImpl } = stub(() => refuse
+      ? respond({ code: 401, message: "Invalid API key" })
+      : respond({ code: 200, data: { success: false, message: "device offline" } }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, noSleep)!;
+    await expect(client.devices()).rejects.toThrow("DuoPlus refused the request: Invalid API key");
+    refuse = false;
+    await expect(client.run("duoplus:a", ["shell", "ls"])).rejects.toThrow("device offline");
+  });
+
+  it("spaces calls to the same endpoint to respect the one-request-per-second limit", async () => {
+    const waits: number[] = [];
+    const { fetchImpl } = stub(() => respond({ code: 200, data: { success: true, content: "" } }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, async (ms) => { waits.push(ms); })!;
+    await Promise.all([client.run("duoplus:a", ["shell", "ls"]), client.run("duoplus:a", ["shell", "ls"])]);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toBeGreaterThan(900);
   });
 });
