@@ -5,6 +5,8 @@ import {
   createPhoneClaim,
   duoPlusAgentCommand,
   duoPlusCommand,
+  duoPlusRoutes,
+  asciiJson,
   findPackages,
   parseDevices,
   parseDuoPlusPhones,
@@ -185,6 +187,71 @@ describe("DuoPlus cloud phones", () => {
     await expect(client.devices()).rejects.toThrow("DuoPlus refused the request: Invalid API key");
     refuse = false;
     await expect(client.run("duoplus:a", ["shell", "ls"])).rejects.toThrow("device offline");
+  });
+
+  it("decodes numeric character references in screen text", () => {
+    expect(parseUiNodes(`<?xml version="1.0"?><hierarchy><node text="caf&#233; &#128512; &#x2713; &amp;#65;" bounds="[0,0][1,1]" /></hierarchy>`)[0].text).toBe("café 😀 ✓ &#65;");
+  });
+
+  it("escapes non-ASCII text so the gateway passes it through intact", () => {
+    const body = asciiJson({ content: "Wi‑Fi café ✓ 日本 😀" });
+    expect(body).toMatch(/^[\x20-\x7e]+$/);
+    expect(JSON.parse(body)).toEqual({ content: "Wi‑Fi café ✓ 日本 😀" });
+  });
+
+  it("routes only running, AI-enabled phones with a valid region and IP through the gateway", () => {
+    expect([...duoPlusRoutes([
+      { id: "a", http_status: 1, region: "SG1", ip: "10.250.81.96" },
+      { id: "b", http_status: 0, region: "sg1", ip: "10.0.0.2" },
+      { id: "c", http_status: 1, region: "sg1", ip: "" },
+      { id: "d", http_status: 1, region: "sg1\r\nx: y", ip: "10.0.0.4" },
+    ])]).toEqual([["duoplus:a", { region: "sg1", ip: "10.250.81.96" }]]);
+  });
+
+  const gatewayPhone = { id: "a", status: 1, http_status: 1, region: "sg1", ip: "10.0.0.9" };
+  const gatewayReply = (inner: Record<string, unknown>, state = "SUCCEEDED") => respond({ state, result_json: JSON.stringify(inner) });
+
+  it("runs shell commands and actions through the AI gateway when the phone supports it", async () => {
+    const { calls, fetchImpl } = stub((request) => request.url.endsWith("/list")
+      ? respond({ code: 200, data: { list: [gatewayPhone] } })
+      : gatewayReply({ success: true, result_text: "Physical size: 1080x1920\n" }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, noSleep)!;
+    await client.devices();
+    await expect(client.run("duoplus:a", ["shell", "wm", "size"])).resolves.toEqual(Buffer.from("Physical size: 1080x1920\n"));
+    await client.act("duoplus:a", "INPUT_CONTENT", { content: "café", clear_first: false });
+    const [, shell, action] = calls;
+    expect(shell.request.url).toBe("https://agent-gateway.duoplus.net/agent-command");
+    expect(shell.request.headers.get("authorization")).toBe("Bearer key");
+    expect(shell.request.headers.get("region")).toBe("sg1");
+    expect(shell.request.headers.get("cloudip")).toBe("10.0.0.9");
+    expect(shell.body).toMatchObject({ operation: "submit", action: "execute", payload: { action_name: "SHELL_COMMAND", params: { command: "wm size", need_screenshot: false } } });
+    expect(action.body).toMatchObject({ payload: { action_name: "INPUT_CONTENT", params: { content: "café" } } });
+    expect(await action.request.clone().text()).toContain("caf\\u00e9");
+  });
+
+  it("reports a gateway action that ran and failed instead of repeating it", async () => {
+    const { calls, fetchImpl } = stub((request) => request.url.endsWith("/list")
+      ? respond({ code: 200, data: { list: [gatewayPhone] } })
+      : gatewayReply({ success: false, message: "Click element - Failed" }, "FAILED"));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, noSleep)!;
+    await client.devices();
+    await expect(client.act("duoplus:a", "SLIDE_PAGE", { direction: "up" })).rejects.toThrow("Click element - Failed");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("falls back to the command API and the agent broadcast when the gateway cannot reach the phone", async () => {
+    const waits: number[] = [];
+    const { calls, fetchImpl } = stub((request) => request.url.endsWith("/list")
+      ? respond({ code: 200, data: { list: [gatewayPhone] } })
+      : request.url.endsWith("/agent-command")
+        ? new Response("Forbidden", { status: 403 })
+        : respond({ code: 200, data: { success: true, content: "Broadcast completed: result=0\n" } }));
+    const client = createDuoPlusClient({ DUOPLUS_API_KEY: "key" }, fetchImpl, async (ms) => { waits.push(ms); })!;
+    await client.devices();
+    await client.act("duoplus:a", "SLIDE_PAGE", { direction: "up" });
+    expect(calls.map((call) => new URL(call.request.url).pathname)).toEqual(["/api/v1/cloudPhone/list", "/agent-command", "/api/v1/cloudPhone/command"]);
+    expect(String(calls[2].body.command)).toMatch(/^am broadcast -a com\.duoplus\.service\.PROCESS_DATA --es message /);
+    expect(waits).toContain(1_500);
   });
 
   it("spaces calls to the same endpoint to respect the one-request-per-second limit", async () => {

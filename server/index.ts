@@ -2505,6 +2505,7 @@ function phoneIntegration(botId: string, threadId: string, generation: string) {
   if (process.env.PH_ANDROID_SERIAL) env.PH_ANDROID_SERIAL = process.env.PH_ANDROID_SERIAL;
   if (process.env.DUOPLUS_API_KEY) env.DUOPLUS_API_KEY = process.env.DUOPLUS_API_KEY;
   if (process.env.DUOPLUS_API_URL) env.DUOPLUS_API_URL = process.env.DUOPLUS_API_URL;
+  if (process.env.DUOPLUS_GATEWAY_URL) env.DUOPLUS_GATEWAY_URL = process.env.DUOPLUS_GATEWAY_URL;
   return { command: process.execPath, args: [phoneProxyPath], env };
 }
 

@@ -1,5 +1,5 @@
 // First-party Android phone MCP server: physical USB devices (no emulators, wireless or network ADB), plus
-// DuoPlus cloud phones driven through DuoPlus's own HTTPS API when DUOPLUS_API_KEY is set.
+// DuoPlus cloud phones driven through DuoPlus's AI gateway, or its command API, when DUOPLUS_API_KEY is set.
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
@@ -45,7 +45,12 @@ const DUOPLUS_STATES: Record<number, string> = {
   11: "configuring",
   12: "configuration failed",
 };
-// The DuoPlus agent service on every cloud phone takes Base64 JSON actions over this broadcast. Base64 is shell-safe.
+// DuoPlus's AI gateway reaches the agent service on a running phone and answers once each action has finished.
+const DUOPLUS_GATEWAY = "https://agent-gateway.duoplus.net/agent-command";
+const DUOPLUS_GATEWAY_TIMEOUT_MS = 60_000;
+const GATEWAY_REGION = /^[a-z]{2}\d*$/;
+const GATEWAY_IP = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+// Without the gateway, the same agent service on every cloud phone takes Base64 JSON actions over this broadcast. Base64 is shell-safe.
 const DUOPLUS_AGENT_BROADCAST = "com.duoplus.service.PROCESS_DATA";
 // Agent actions run after the broadcast returns; wait so the next read or tap sees their effect.
 const DUOPLUS_AGENT_SETTLE_MS = 1_500;
@@ -138,7 +143,29 @@ export function parseDevices(output: string): Device[] {
   return devices;
 }
 
-type DuoPlusPhone = { id?: unknown; name?: unknown; status?: unknown; os?: unknown };
+type DuoPlusPhone = { id?: unknown; name?: unknown; status?: unknown; os?: unknown; ip?: unknown; region?: unknown; http_status?: unknown };
+type GatewayRoute = { region: string; ip: string };
+
+/** Phones DuoPlus's AI gateway can reach: running, AI access on, with a private IP and a gateway region. */
+export function duoPlusRoutes(list: unknown): Map<string, GatewayRoute> {
+  const routes = new Map<string, GatewayRoute>();
+  if (!Array.isArray(list)) return routes;
+  for (const phone of list as DuoPlusPhone[]) {
+    const region = typeof phone?.region === "string" ? phone.region.trim().toLowerCase() : "";
+    const ip = typeof phone?.ip === "string" ? phone.ip.trim() : "";
+    if (typeof phone?.id !== "string" || !phone.id || Number(phone.http_status) !== 1) continue;
+    if (GATEWAY_REGION.test(region) && GATEWAY_IP.test(ip)) routes.set(`${DUOPLUS_PREFIX}${phone.id}`, { region, ip });
+  }
+  return routes;
+}
+
+/** JSON with every non-ASCII character escaped as \\uXXXX (emoji as surrogate pairs). */
+export function asciiJson(value: unknown): string {
+  return JSON.stringify(value).replace(/[\u007f-\uffff]/g, (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** The gateway could not reach the phone, so nothing ran there and the command API can take over safely. */
+class GatewayUnavailable extends Error {}
 
 export function parseDuoPlusPhones(list: unknown): Device[] {
   if (!Array.isArray(list)) return [];
@@ -176,6 +203,8 @@ export function createDuoPlusClient(
   const key = env.DUOPLUS_API_KEY?.trim();
   if (!key) return null;
   const base = env.DUOPLUS_API_URL?.trim() || DUOPLUS_API;
+  const gatewayUrl = env.DUOPLUS_GATEWAY_URL?.trim() || DUOPLUS_GATEWAY;
+  const routes = new Map<string, GatewayRoute>();
   const lastCall = new Map<string, number>();
   let queue: Promise<unknown> = Promise.resolve();
 
@@ -204,20 +233,84 @@ export function createDuoPlusClient(
     return run;
   };
 
+  async function platformCommand(serial: string, command: string): Promise<string> {
+    const data = await call("/api/v1/cloudPhone/command", { image_id: serial.slice(DUOPLUS_PREFIX.length), command }) as
+      { success?: unknown; content?: unknown; message?: unknown } | null;
+    if (data?.success !== true) {
+      throw new Error(typeof data?.message === "string" && data.message ? data.message : "The DuoPlus cloud phone did not run the command");
+    }
+    return typeof data.content === "string" ? data.content : "";
+  }
+
+  // Runs one agent action and waits for it to finish. Not rate limited like the control API.
+  async function gateway(serial: string, actionName: string, params: Json): Promise<string> {
+    const route = routes.get(serial);
+    if (!route) throw new GatewayUnavailable("The phone has no AI gateway route");
+    const taskId = `mausbot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let response: Response;
+    try {
+      response = await fetchImpl(gatewayUrl, {
+        method: "POST",
+        redirect: "error",
+        headers: { authorization: `Bearer ${key!}`, region: route.region, cloudip: route.ip, "content-type": "application/json" },
+        // The gateway garbles raw UTF-8 in request bodies; JSON escapes reach the phone intact.
+        body: asciiJson({
+          operation: "submit",
+          command_id: `${taskId}-command`,
+          task_id: taskId,
+          action: "execute",
+          payload: { task_type: "ai", task_id: taskId, action: "execute", lang: "en", action_name: actionName, params },
+        }),
+        signal: AbortSignal.timeout(DUOPLUS_GATEWAY_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // After a timeout the action may still have run: never repeat it through the command API.
+      if (error instanceof Error && error.name === "TimeoutError") throw new Error("The DuoPlus cloud phone did not answer in time");
+      throw new GatewayUnavailable(error instanceof Error ? error.message : String(error));
+    }
+    if (!response.ok) throw new GatewayUnavailable(`HTTP ${response.status}`);
+    const outer = await response.json().catch(() => null) as { state?: unknown; message?: unknown; result_json?: unknown } | null;
+    let inner: { success?: unknown; message?: unknown; result_text?: unknown } | null = null;
+    try {
+      inner = JSON.parse(String(outer?.result_json));
+    } catch {
+      inner = null;
+    }
+    if (outer?.state !== "SUCCEEDED" || inner?.success !== true) {
+      const reason = [inner?.message, outer?.message].find((value) => typeof value === "string" && value);
+      throw new Error(typeof reason === "string" ? reason : "The DuoPlus cloud phone could not do that");
+    }
+    return typeof inner.result_text === "string" ? inner.result_text : "";
+  }
+
   return {
     async devices(): Promise<Device[]> {
       const data = await call("/api/v1/cloudPhone/list", { page: 1, pagesize: 100 }) as { list?: unknown } | null;
+      routes.clear();
+      for (const [serial, route] of duoPlusRoutes(data?.list)) routes.set(serial, route);
       return parseDuoPlusPhones(data?.list);
     },
     async run(serial: string, args: string[]): Promise<Buffer> {
       const { command, base64 } = duoPlusCommand(args);
-      const data = await call("/api/v1/cloudPhone/command", { image_id: serial.slice(DUOPLUS_PREFIX.length), command }) as
-        { success?: unknown; content?: unknown; message?: unknown } | null;
-      if (data?.success !== true) {
-        throw new Error(typeof data?.message === "string" && data.message ? data.message : "The DuoPlus cloud phone did not run the command");
+      let content: string;
+      try {
+        content = await gateway(serial, "SHELL_COMMAND", { command, need_screenshot: false });
+      } catch (error) {
+        if (!(error instanceof GatewayUnavailable)) throw error;
+        content = await platformCommand(serial, command);
       }
-      const content = typeof data.content === "string" ? data.content : "";
       return base64 ? Buffer.from(content.replace(/\s+/g, ""), "base64") : Buffer.from(content, "utf8");
+    },
+    async act(serial: string, actionName: string, params: Json): Promise<void> {
+      try {
+        await gateway(serial, actionName, params);
+        return;
+      } catch (error) {
+        if (!(error instanceof GatewayUnavailable)) throw error;
+      }
+      const output = await platformCommand(serial, duoPlusAgentCommand(actionName, params));
+      if (!output.includes("Broadcast completed")) throw new Error("The DuoPlus cloud phone did not accept the action");
+      await sleep(DUOPLUS_AGENT_SETTLE_MS);
     },
   };
 }
@@ -251,12 +344,6 @@ async function readySerial(requested?: unknown): Promise<string> {
 async function onDevice(serial: string, args: string[], binary = false) {
   if (duoPlus && serial.startsWith(DUOPLUS_PREFIX)) return duoPlus.run(serial, args);
   return runAdb(["-s", serial, ...args], { binary });
-}
-
-async function duoPlusAgent(serial: string, actionName: string, params: Json) {
-  const output = (await onDevice(serial, ["shell", duoPlusAgentCommand(actionName, params)])).toString("utf8");
-  if (!output.includes("Broadcast completed")) throw new Error("The DuoPlus cloud phone did not accept the action");
-  await new Promise((resolve) => setTimeout(resolve, DUOPLUS_AGENT_SETTLE_MS));
 }
 
 function normalize(value: string) {
@@ -304,6 +391,11 @@ function decodeXml(value: string) {
     .replaceAll("&apos;", "'")
     .replaceAll("&lt;", "<")
     .replaceAll("&gt;", ">")
+    // uiautomator writes emoji and other astral characters as numeric references.
+    .replace(/&#(x[0-9a-f]+|\d+);/gi, (entity, code: string) => {
+      const point = code[0].toLowerCase() === "x" ? Number.parseInt(code.slice(1), 16) : Number(code);
+      return point <= 0x10ffff ? String.fromCodePoint(point) : entity;
+    })
     .replaceAll("&amp;", "&");
 }
 
@@ -331,6 +423,15 @@ export function parseUiNodes(xml: string): UiNode[] {
 }
 
 async function readNodes(serial: string) {
+  if (serial.startsWith(DUOPLUS_PREFIX)) {
+    // One round trip: each DuoPlus call costs seconds, and `dump /dev/tty` prints no XML there.
+    // Base64 keeps non-ASCII labels intact; the gateway garbles raw UTF-8 output.
+    const remotePath = "/data/local/tmp/openmaus-window.xml";
+    const encoded = (await onDevice(serial, ["shell", `uiautomator dump ${remotePath} >/dev/null && base64 ${remotePath}; rm -f ${remotePath}`])).toString("utf8");
+    const dumped = Buffer.from(encoded.replace(/\s+/g, ""), "base64").toString("utf8");
+    const start = dumped.indexOf("<?xml");
+    return parseUiNodes(start >= 0 ? dumped.slice(start) : dumped);
+  }
   const streamed = (await onDevice(serial, ["shell", "uiautomator", "dump", "/dev/tty"])).toString("utf8");
   const streamedStart = streamed.indexOf("<?xml");
   if (streamedStart >= 0) return parseUiNodes(streamed.slice(streamedStart));
@@ -458,7 +559,7 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
     const direction = String(args.direction ?? "");
     if (cloud) {
       if (!["up", "down", "left", "right"].includes(direction)) throw new Error("Invalid swipe direction");
-      await duoPlusAgent(serial, "SLIDE_PAGE", { direction });
+      await duoPlus!.act(serial, "SLIDE_PAGE", { direction });
       return textResult(`Swiped ${direction}`);
     }
     const size = (await onDevice(serial, ["shell", "wm", "size"])).toString("utf8");
@@ -480,7 +581,7 @@ async function callTool(name: string, args: Json): Promise<ToolResult> {
     const value = String(args.text ?? "");
     if (cloud) {
       if (!value || value.length > 256 || !CLOUD_TEXT.test(value)) throw new Error("Android text must be one line of up to 256 characters");
-      await duoPlusAgent(serial, "INPUT_CONTENT", { content: value, clear_first: false });
+      await duoPlus!.act(serial, "INPUT_CONTENT", { content: value, clear_first: false });
       return textResult("Typed text into the focused Android field");
     }
     if (!value || value.length > 256 || !SAFE_TEXT.test(value)) throw new Error("Android text supports only basic ASCII text up to 256 characters");
