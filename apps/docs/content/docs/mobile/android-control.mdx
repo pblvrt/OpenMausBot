@@ -14,3 +14,20 @@ OpenMausBot can expose a USB-connected Android device through its Phone Harness 
 - The packaged Android platform tools or a compatible local ADB installation
 
 Phone access is a separate capability from desktop computer use. Keep the device unlocked and visible while testing, and review actions that may send messages, change accounts, or expose private content.
+
+## DuoPlus cloud phones
+
+A bot can also use [DuoPlus](https://www.duoplus.net) cloud phones, which suits a server or Cloud home with no USB port. The phone tools reach them through DuoPlus's own API, so there is no ADB port to open, no IP whitelist to keep, and no `adb` to install.
+
+1. In the DuoPlus console, open **Automation → API** and copy your API key.
+2. Start OpenMausBot's server with it in the environment:
+
+   ```sh
+   DUOPLUS_API_KEY=your-key openmausbot
+   ```
+
+3. Start the cloud phone in DuoPlus. The phone tools list every phone on the account as `duoplus:<id>` next to any USB device; with more than one device, the bot passes the one it wants as `serial`, or you can pin one with `PH_ANDROID_SERIAL=duoplus:<id>`.
+
+When DuoPlus reports AI access for the phone, the tools drive it through DuoPlus's AI gateway, which runs each step and reports whether it worked; otherwise, or if the gateway can't reach the phone, they fall back to DuoPlus's command API. Typing and swiping go through the DuoPlus agent service that runs on every cloud phone, so a cloud phone can type any one-line text, including accents, other scripts and emoji; a USB phone types basic ASCII only.
+
+Each step takes one to five seconds, slower than on a USB phone; on the command API fallback, DuoPlus's one-request-per-second limit makes it slower still. A powered-off phone is reported as such rather than started: starting a cloud phone is billed by DuoPlus. The key controls every phone on the DuoPlus account, so keep it out of shared shells and logs.

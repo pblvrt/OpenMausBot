@@ -2,7 +2,7 @@
   "id": "phone-harness",
   "name": "Phone Harness",
   "version": "0.1.0",
-  "description": "Control a physical Android phone connected over authorized USB debugging.",
+  "description": "Control a physical Android phone connected over authorized USB debugging, or a DuoPlus cloud phone.",
   "defaultEnabled": true,
   "triggerTerms": [
     "android",
@@ -11,7 +11,9 @@
     "adb",
     "my phone",
     "mobile app",
-    "on the phone"
+    "on the phone",
+    "duoplus",
+    "cloud phone"
   ],
   "requiredCapabilities": ["phoneMcp"]
 }
